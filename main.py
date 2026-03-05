@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================
-#  bot.py  –  Telegram Trading Signal Bot (entry point)
-#             Supports scanning ALL USDT futures pairs with
-#             async concurrency and rate limiting.
+#  bot.py  –  Telegram Trading Signal Bot
 # ============================================================
 
 import asyncio
@@ -11,17 +9,14 @@ import sys
 import time
 
 from telegram import Update, Bot
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes, JobQueue
-)
+from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue
 from telegram.constants import ParseMode
 
 import config
 from binance_client import get_liquid_symbols
 from strategy       import analyse_pair
-from formatter      import format_signal, format_scan_header, format_no_signals
+from formatter      import format_signal, format_no_signals
 
-# ── Logging ──────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
@@ -32,7 +27,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Prevent overlapping scans
 _scan_lock = asyncio.Lock()
 
 
@@ -63,28 +57,36 @@ async def send_msg(bot: Bot, text: str, chat_id: str):
         logger.error("send_message failed: %s", exc)
 
 
-# ── Pair resolver ─────────────────────────────────────────────
+# ── Pair resolver (now returns error details) ─────────────────
 
-def _resolve_pairs() -> list:
-    if config.SCAN_MODE == "all":
-        logger.info("Fetching all liquid USDT futures pairs …")
-        try:
-            pairs = get_liquid_symbols(
-                min_volume_usdt=config.MIN_VOLUME_USDT,
-                max_pairs=config.MAX_PAIRS,
-            )
-            logger.info("%d pairs queued.", len(pairs))
-            return pairs
-        except Exception as exc:
-            logger.error("Symbol fetch failed: %s — using WATCHLIST", exc)
-            return config.WATCHLIST
-    return config.WATCHLIST
+def _resolve_pairs() -> tuple:
+    """
+    Returns (pairs: list, source: str, error: str|None)
+    source is 'binance_api' or 'watchlist_fallback'
+    """
+    if config.SCAN_MODE != "all":
+        return config.WATCHLIST, "watchlist", None
+
+    logger.info("Fetching all liquid USDT futures pairs from Binance …")
+    try:
+        pairs = get_liquid_symbols(
+            min_volume_usdt=config.MIN_VOLUME_USDT,
+            max_pairs=config.MAX_PAIRS,
+        )
+        if not pairs:
+            return (config.WATCHLIST, "watchlist_fallback",
+                    f"No pairs passed the ${config.MIN_VOLUME_USDT:,.0f} volume filter")
+        logger.info("Binance returned %d liquid pairs.", len(pairs))
+        return pairs, "binance_api", None
+    except Exception as exc:
+        err = str(exc)
+        logger.error("get_liquid_symbols failed: %s", err)
+        return config.WATCHLIST, "watchlist_fallback", err
 
 
 # ── Async concurrent scanner ──────────────────────────────────
 
-async def _analyse_one(symbol: str, semaphore: asyncio.Semaphore,
-                        delay: float):
+async def _analyse_one(symbol: str, semaphore: asyncio.Semaphore, delay: float):
     async with semaphore:
         await asyncio.sleep(delay)
         loop = asyncio.get_event_loop()
@@ -102,51 +104,70 @@ async def _run_concurrent_scan(pairs: list) -> list:
         for i, sym in enumerate(pairs)
     ]
     results = await asyncio.gather(*tasks)
-    signals = [r for r in results if r is not None]
-    return sorted(signals, key=lambda s: s.score, reverse=True)
+    return sorted([r for r in results if r], key=lambda s: s.score, reverse=True)
 
 
 # ── Core scan routine ─────────────────────────────────────────
 
 async def run_scan(bot: Bot, chat_id: str):
     if _scan_lock.locked():
-        await send_msg(bot, "⏳ A scan is already in progress …", chat_id)
+        await send_msg(bot, "⏳ A scan is already running, please wait …", chat_id)
         return
 
     async with _scan_lock:
         t_start = time.monotonic()
-        logger.info("Scan started (chat %s)", chat_id)
+
+        # Step 1: resolve pairs with full transparency
+        pairs, source, error = await asyncio.get_event_loop().run_in_executor(
+            None, _resolve_pairs
+        )
+
+        # Build status header
+        if source == "binance_api":
+            fetch_status = (
+                f"✅ *Binance API:* fetched *{len(pairs)} liquid pairs*\n"
+                f"   Min 24h vol: `${config.MIN_VOLUME_USDT:,.0f}`"
+            )
+        elif source == "watchlist_fallback":
+            fetch_status = (
+                f"⚠️ *Binance fetch failed — using WATCHLIST ({len(pairs)} pairs)*\n"
+                f"   Error: `{error}`\n"
+                f"   Fix: check network / lower `MIN_VOLUME_USDT` in config.py"
+            )
+        else:
+            fetch_status = f"📋 *Watchlist mode:* {len(pairs)} pairs"
 
         await send_msg(
             bot,
-            f"🔍 *Starting scan …*\n"
-            f"Mode: `{config.SCAN_MODE.upper()}`  |  "
-            f"Min 24h vol: `${config.MIN_VOLUME_USDT:,.0f}`",
+            f"🔍 *Scan started*\n"
+            f"Mode: `{config.SCAN_MODE.upper()}`\n"
+            f"{fetch_status}",
             chat_id,
         )
 
-        pairs = await asyncio.get_event_loop().run_in_executor(
-            None, _resolve_pairs
-        )
         if not pairs:
-            await send_msg(bot, "❌ No pairs found.", chat_id)
+            await send_msg(bot, "❌ No pairs to scan.", chat_id)
             return
 
         await send_msg(
             bot,
-            f"📊 Scanning *{len(pairs)} pairs* "
-            f"({config.MAX_CONCURRENT} concurrent) …",
+            f"⚙️ Analysing *{len(pairs)} pairs* "
+            f"({config.MAX_CONCURRENT} concurrent workers) …",
             chat_id,
         )
 
+        # Step 2: concurrent analysis
         signals = await _run_concurrent_scan(pairs)
         elapsed = round(time.monotonic() - t_start, 1)
 
-        header = (
-            f"✅ *Scan complete* in `{elapsed}s`\n"
-            f"Pairs scanned: *{len(pairs)}*  |  Signals: *{len(signals)}*"
+        # Step 3: results
+        await send_msg(
+            bot,
+            f"✅ *Done in `{elapsed}s`*\n"
+            f"Pairs scanned: *{len(pairs)}* (source: `{source}`)\n"
+            f"Signals found: *{len(signals)}*",
+            chat_id,
         )
-        await send_msg(bot, header, chat_id)
 
         if signals:
             for sig in signals:
@@ -155,7 +176,7 @@ async def run_scan(bot: Bot, chat_id: str):
         else:
             await send_msg(bot, format_no_signals(), chat_id)
 
-        logger.info("Scan done — %d signals in %.1fs.", len(signals), elapsed)
+        logger.info("Scan done — %d signals, %.1fs, source=%s", len(signals), elapsed, source)
 
 
 # ── Scheduled job ─────────────────────────────────────────────
@@ -171,12 +192,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 *SMC Crypto Signal Bot*\n\n"
         "Commands:\n"
         "  /scan              — Run scan now\n"
-        "  /status            — Show config\n"
-        "  /setmode all       — Scan ALL USDT pairs\n"
+        "  /pairs             — Show which pairs will be scanned\n"
+        "  /status            — Show full config\n"
+        "  /setmode all       — Scan ALL USDT pairs (live from Binance)\n"
         "  /setmode watchlist — Scan fixed watchlist only\n"
         "  /help              — This message\n\n"
         f"⏱ Auto-scan every *{config.SCAN_INTERVAL_MIN} min*\n"
-        f"🌐 Current mode: *{config.SCAN_MODE.upper()}*"
+        f"🌐 Mode: *{config.SCAN_MODE.upper()}*"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -185,18 +207,46 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_scan(context.bot, str(update.effective_chat.id))
 
 
+async def cmd_pairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show exactly which pairs would be scanned — useful for debugging."""
+    await update.message.reply_text(
+        "🔎 Fetching pair list from Binance, please wait …",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    pairs, source, error = await asyncio.get_event_loop().run_in_executor(
+        None, _resolve_pairs
+    )
+
+    if error:
+        await update.message.reply_text(
+            f"⚠️ *Fetch failed* — fell back to watchlist\n`{error}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    # Show first 50 to avoid flooding
+    preview = pairs[:50]
+    rest    = len(pairs) - len(preview)
+    body    = "  ".join(f"`{p}`" for p in preview)
+    suffix  = f"\n_… and {rest} more_" if rest > 0 else ""
+
+    await update.message.reply_text(
+        f"📋 *{len(pairs)} pairs* (source: `{source}`)\n\n{body}{suffix}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if config.SCAN_MODE == "all":
-        pairs_info = (
-            f"Mode: *ALL pairs*\n"
+        scan_info = (
+            f"Mode: *ALL pairs (live Binance)*\n"
             f"  • Min 24h volume: `${config.MIN_VOLUME_USDT:,.0f}`\n"
             f"  • Max pairs cap: `{'none' if not config.MAX_PAIRS else config.MAX_PAIRS}`\n"
             f"  • Concurrency: `{config.MAX_CONCURRENT}` workers\n"
             f"  • Request stagger: `{config.REQUEST_DELAY}s`"
         )
     else:
-        pairs_info = "Mode: *WATCHLIST*\n" + "\n".join(
-            f"  • {p}" for p in config.WATCHLIST
+        scan_info = "Mode: *WATCHLIST*\n" + "  ".join(
+            f"`{p}`" for p in config.WATCHLIST
         )
 
     text = (
@@ -204,7 +254,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"HTF: `{config.HTF}`  LTF: `{config.LTF}`\n"
         f"Scan every: `{config.SCAN_INTERVAL_MIN} min`\n"
         f"Min score: `{config.MIN_SCORE}%`  Min R:R: `1:{config.MIN_RR}`\n\n"
-        f"📋 {pairs_info}"
+        f"📋 {scan_info}\n\n"
+        f"💡 Use /pairs to see exactly what gets scanned"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -219,7 +270,8 @@ async def cmd_setmode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     config.SCAN_MODE = args[0]
     await update.message.reply_text(
-        f"✅ Mode → *{config.SCAN_MODE.upper()}*",
+        f"✅ Mode → *{config.SCAN_MODE.upper()}*\n"
+        f"Use /pairs to verify which pairs will be scanned next.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -236,6 +288,7 @@ def main():
 
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("scan",    cmd_scan))
+    app.add_handler(CommandHandler("pairs",   cmd_pairs))
     app.add_handler(CommandHandler("status",  cmd_status))
     app.add_handler(CommandHandler("setmode", cmd_setmode))
     app.add_handler(CommandHandler("help",    cmd_help))
