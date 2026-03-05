@@ -36,8 +36,8 @@ logger = logging.getLogger(__name__)
 #  CONFIG — edit only this section
 # ════════════════════════════════════════════════════════════
 
-TELEGRAM_TOKEN   = "YOUR_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
+TELEGRAM_TOKEN   = "7732870721:AAEHG3QJdo31S9sA8xjJzf-cXj6Tn4mo2uo"
+TELEGRAM_CHAT_ID = "7500072234"
 
 HTF              = "4h"
 LTF              = "15m"
